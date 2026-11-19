@@ -1,0 +1,412 @@
+"""SO-ARM101 Pick and Place Task — reach, grasp, lift, and place a cube."""
+
+import math
+import torch
+import gymnasium as gym
+
+import isaaclab.sim as sim_utils
+from isaaclab.assets import ArticulationCfg, Articulation, RigidObjectCfg, RigidObject
+from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
+from isaaclab.scene import InteractiveSceneCfg
+from isaaclab.sim import SimulationCfg
+from isaaclab.utils import configclass
+from isaaclab.markers import VisualizationMarkersCfg, VisualizationMarkers
+
+from so101_robot_cfg import SO101_CFG
+
+
+# ─────────────────────────────────────────────
+# Config
+# ─────────────────────────────────────────────
+
+@configclass
+class SO101PickPlaceEnvCfg(DirectRLEnvCfg):
+    """Config for pick-and-place task."""
+
+    # Sim
+    sim: SimulationCfg = SimulationCfg(dt=1 / 120, render_interval=2)
+    decimation = 2
+
+    # Task dimensions
+    num_observations = 30
+    num_actions = 6
+    episode_length_s = 8.0
+
+    # Scene
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(
+        num_envs=512,
+        env_spacing=1.5,
+        replicate_physics=False,
+    )
+
+    # Robot
+    robot_cfg: ArticulationCfg = SO101_CFG.replace(
+        prim_path="/World/envs/env_.*/Robot"
+    )
+
+    # Cube — 3cm blue cube, light (10 grams), high friction
+    cube_cfg: RigidObjectCfg = RigidObjectCfg(
+        prim_path="/World/envs/env_.*/Cube",
+        spawn=sim_utils.CuboidCfg(
+            size=(0.03, 0.03, 0.03),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(),
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.01),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            physics_material=sim_utils.RigidBodyMaterialCfg(
+                static_friction=1.0,
+                dynamic_friction=1.0,
+            ),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.5, 1.0)),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.1, 0.0, 0.015)),
+    )
+
+    # ── Spawn ranges (local coords) ──
+    cube_min = [0.15, -0.08, 0.015]
+    cube_max = [0.25, 0.08, 0.015]
+
+    goal_min = [0.15, -0.08, 0.06]
+    goal_max = [0.25, 0.08, 0.12]
+
+    # ── Reward weights ──
+    reward_reach          = 1.0
+    reward_grasp          = 2.0
+    reward_lift           = 8.0     # was 5.0
+    reward_lift_abs       = 3.0     # was 1.5
+    reward_goal           = 10.0
+    reward_success        = 20.0
+    reward_action_penalty = -0.0001
+    reward_action_rate    = -0.0001
+
+    # ── Thresholds ──
+    lift_height  = 0.02     # lowered from 0.04 → easier to trigger goal_reward
+    grasp_dist   = 0.05
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.observation_space = gym.spaces.Box(
+            low=-float("inf"), high=float("inf"), shape=(self.num_observations,)
+        )
+        self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(self.num_actions,))
+
+
+# ─────────────────────────────────────────────
+# Environment
+# ─────────────────────────────────────────────
+
+class SO101PickPlaceEnv(DirectRLEnv):
+    """Pick and place — reach, grasp (latched), lift, place."""
+
+    cfg: SO101PickPlaceEnvCfg
+
+    def __init__(self, cfg: SO101PickPlaceEnvCfg, render_mode=None, **kwargs):
+        super().__init__(cfg, render_mode, **kwargs)
+
+        # Joint indices (all 6 — 5 arm + 1 gripper)
+        self.arm_joint_ids, _ = self.robot.find_joints(
+            ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
+        )
+
+        # End effector body
+        self.ee_body_id, _ = self.robot.find_bodies(["gripper_frame_link"])
+
+        # Gripper joint limits
+        gripper_limits = self.robot.root_physx_view.get_dof_limits()[0, 5]
+        self.gripper_low  = gripper_limits[0].item()   # closed
+        self.gripper_high = gripper_limits[1].item()   # open
+
+        # Persistent buffers
+        self.goals               = torch.zeros(self.num_envs, 3, device=self.device)
+        self.cube_start_z        = torch.zeros(self.num_envs, device=self.device)
+        self._prev_targets       = torch.zeros(self.num_envs, 6, device=self.device)
+
+        # ── NEW: latch + delta-height buffers ──
+        self._holding_latch      = torch.zeros(self.num_envs, device=self.device)
+        self._prev_cube_height   = torch.zeros(self.num_envs, device=self.device)
+        self._success_latch      = torch.zeros(self.num_envs, device=self.device)
+
+        # Randomize on start
+        all_ids = torch.arange(self.num_envs, device=self.device)
+        self._randomize_cube(all_ids)
+        self._randomize_goals(all_ids)
+
+    # ── Scene setup ──
+
+    def _setup_scene(self):
+        self.robot = Articulation(self.cfg.robot_cfg)
+        self.scene.articulations["robot"] = self.robot
+
+        self.cube = RigidObject(self.cfg.cube_cfg)
+        self.scene.rigid_objects["cube"] = self.cube
+
+        ground_cfg = sim_utils.CuboidCfg(
+            size=(100.0, 100.0, 0.02),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.3, 0.3, 0.3)),
+        )
+        ground_cfg.func("/World/ground", ground_cfg, translation=(0.0, 0.0, -0.01))
+
+        goal_marker_cfg = VisualizationMarkersCfg(
+            prim_path="/Visuals/goals",
+            markers={
+                "sphere": sim_utils.SphereCfg(
+                    radius=0.02,
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0)),
+                ),
+            },
+        )
+        self.goal_markers = VisualizationMarkers(goal_marker_cfg)
+
+    # ── Actions ──
+
+    def _pre_physics_step(self, actions: torch.Tensor):
+        joint_limits = self.robot.root_physx_view.get_dof_limits().to(self.device)
+        lower = joint_limits[..., 0][:, :6]
+        upper = joint_limits[..., 1][:, :6]
+        self._targets = 0.5 * (actions + 1.0) * (upper - lower) + lower
+
+    def _apply_action(self):
+        self.robot.set_joint_position_target(self._targets, joint_ids=self.arm_joint_ids)
+
+    # ── Observations (30 dim) ──
+
+    def _get_observations(self) -> dict:
+        joint_pos = self.robot.data.joint_pos[:, :6]
+        joint_vel = self.robot.data.joint_vel[:, :6]
+
+        joint_limits = self.robot.root_physx_view.get_dof_limits().to(self.device)
+        lower = joint_limits[..., 0][:, :6]
+        upper = joint_limits[..., 1][:, :6]
+        joint_pos_norm  = 2.0 * (joint_pos - lower) / (upper - lower) - 1.0
+        joint_vel_scaled = joint_vel * 0.1
+
+        ee_pos       = self.robot.data.body_pos_w[:, self.ee_body_id[0], :]
+        ee_pos_local = ee_pos - self.scene.env_origins
+
+        cube_pos       = self.cube.data.root_pos_w
+        cube_pos_local = cube_pos - self.scene.env_origins
+
+        goal_pos_local = self.goals - self.scene.env_origins
+
+        ee_to_cube    = cube_pos_local - ee_pos_local
+        cube_to_goal  = goal_pos_local - cube_pos_local
+
+        dist_ee_cube   = torch.norm(ee_to_cube,   dim=-1, keepdim=True)
+        dist_cube_goal = torch.norm(cube_to_goal, dim=-1, keepdim=True)
+
+        cube_height = (cube_pos_local[:, 2:3] - self.cube_start_z.unsqueeze(-1))
+
+        obs = torch.cat([
+            joint_pos_norm,      # 6
+            joint_vel_scaled,    # 6
+            ee_pos_local,        # 3
+            cube_pos_local,      # 3
+            goal_pos_local,      # 3
+            ee_to_cube,          # 3
+            cube_to_goal,        # 3
+            dist_ee_cube,        # 1
+            dist_cube_goal,      # 1
+            cube_height,         # 1
+        ], dim=-1)               # total: 30
+
+        if hasattr(self, "goal_markers"):
+            self.goal_markers.visualize(self.goals)
+
+        return {"policy": obs}
+
+    # ── Rewards ──
+
+    def _get_rewards(self) -> torch.Tensor:
+        ee_pos   = self.robot.data.body_pos_w[:, self.ee_body_id[0], :]
+        cube_pos = self.cube.data.root_pos_w
+
+        dist_ee_cube   = torch.norm(ee_pos - cube_pos, dim=-1)
+        dist_cube_goal = torch.norm(cube_pos - self.goals, dim=-1)
+
+        gripper_pos  = self.robot.data.joint_pos[:, 5]
+        gripper_open = (gripper_pos - self.gripper_low) / (self.gripper_high - self.gripper_low)
+        gripper_open = gripper_open.clamp(0, 1)
+
+        cube_height = (cube_pos[:, 2] - self.scene.env_origins[:, 2]) - self.cube_start_z
+
+        # ── Stage 1: Reach ──
+        approaching   = (dist_ee_cube > 0.05).float()
+        reach_distance = 1.0 - torch.tanh(5.0 * dist_ee_cube)
+        reach_reward  = self.cfg.reward_reach * reach_distance * approaching * (0.5 + 0.5 * gripper_open)
+
+        # ── Latch / hysteresis for holding ── (must be before grasp_reward)
+        # Latch ON:  dist < 0.05 AND gripper closed (open < 0.4)
+        # Latch OFF: gripper wide open OR cube clearly back on table
+        new_hold  = (dist_ee_cube < 0.05) & (gripper_open < 0.4)
+        drop_cond = (gripper_open > 0.6) | (dist_ee_cube > 0.08)
+
+        self._holding_latch = torch.where(
+            new_hold,
+            torch.ones_like(self._holding_latch),
+            self._holding_latch
+        )
+        self._holding_latch = torch.where(
+            drop_cond,
+            torch.zeros_like(self._holding_latch),
+            self._holding_latch
+        )
+        raw_holding       = self._holding_latch.bool()
+        bootstrap_holding = raw_holding & (cube_height > 0.001) & (dist_ee_cube < 0.04)   # 1mm + EE nearby
+        true_holding      = raw_holding & (cube_height > 0.003) & (dist_ee_cube < 0.035)  # 3mm + EE nearby
+
+        # ── Stage 2: Grasp — stop once latch triggers, force transition to lift ──
+        very_close   = (dist_ee_cube < 0.05).float()
+        grasp_reward = self.cfg.reward_grasp * very_close * (1.0 - gripper_open)
+
+        # ── Stage 2.5: Hold reward — height-conditioned, no table-top payout ──
+        height_factor = torch.clamp(cube_height / 0.05, 0.0, 1.0)
+        hold_reward   = 3.0 * true_holding.float() * height_factor   # 桌上=0，举高才赚钱
+
+        # ── Stage 3: Lift — Δheight + absolute height ──
+        delta_height    = cube_height - self._prev_cube_height
+        lift_progress   = self.cfg.reward_lift     * bootstrap_holding.float() * torch.clamp(delta_height * 100.0, 0.0, 1.0)
+        lift_height_abs = self.cfg.reward_lift_abs * true_holding.float() * height_factor
+        lift_reward     = lift_progress + lift_height_abs
+
+        # ── Stage 4: Goal ──
+        cube_lifted  = (cube_height > self.cfg.lift_height).float()
+        goal_reward  = self.cfg.reward_goal * cube_lifted * true_holding.float() * (
+            1.0 - torch.tanh(5.0 * dist_cube_goal)
+        )
+
+        # ── Penalties ──
+        vel_penalty  = self.cfg.reward_action_penalty * torch.sum(
+            self.robot.data.joint_vel[:, :6] ** 2, dim=-1
+        )
+        action_rate  = torch.sum((self._targets - self._prev_targets) ** 2, dim=-1)
+        rate_penalty = self.cfg.reward_action_rate * action_rate
+        self._prev_targets = self._targets.clone()
+
+        # ── Success bonus — one-time only ──
+        success     = (dist_cube_goal < 0.05) & (cube_height > self.cfg.lift_height) & true_holding
+        new_success = success & (~self._success_latch.bool())
+        success_bonus = self.cfg.reward_success * new_success.float()
+        self._success_latch = torch.where(
+            success,
+            torch.ones_like(self._success_latch),
+            self._success_latch
+        )
+
+        # ── Update prev height AFTER computing delta ──
+        self._prev_cube_height = cube_height.clone()
+
+        total = (reach_reward + grasp_reward + hold_reward +
+                 lift_reward + goal_reward + success_bonus +
+                 vel_penalty + rate_penalty)
+
+        total = torch.clamp(total, -10.0, 30.0)
+
+        self.extras["log"] = {
+            "mean_cube_height":   cube_height.mean().item(),
+            "max_cube_height":    cube_height.max().item(),
+            "raw_holding_ratio":  raw_holding.float().mean().item(),
+            "holding_ratio":      true_holding.float().mean().item(),
+            "ee_cube_dist":       dist_ee_cube.mean().item(),
+            "goal_reward_rate":   (goal_reward > 0).float().mean().item(),
+            "success_event_rate": new_success.float().mean().item(),
+            "success_state_rate": success.float().mean().item(),
+        }
+        return total
+
+    # ── Termination ──
+
+    def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
+        time_limit     = self.episode_length_buf >= self.max_episode_length
+        cube_pos_local = self.cube.data.root_pos_w - self.scene.env_origins
+        cube_fell      = cube_pos_local[:, 2] < -0.05
+        return cube_fell, time_limit
+
+    # ── Resets ──
+
+    def _reset_idx(self, env_ids: torch.Tensor | None):
+        if env_ids is None or len(env_ids) == 0:
+            return
+
+        super()._reset_idx(env_ids)
+        num = len(env_ids)
+
+        # Reset robot joints
+        joint_pos = self.robot.data.default_joint_pos[env_ids].clone()
+        joint_vel = torch.zeros(num, self.robot.num_joints, device=self.device)
+
+        joint_limits = self.robot.root_physx_view.get_dof_limits().to(self.device)
+        lower = joint_limits[env_ids, :, 0]
+        upper = joint_limits[env_ids, :, 1]
+        joint_pos += torch.randn(num, self.robot.num_joints, device=self.device) * 0.1
+        joint_pos  = torch.clamp(joint_pos, lower, upper)
+
+        # Start gripper open
+        joint_pos[:, 5] = self.gripper_high  # fully open
+
+        self.robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
+
+        # Reset action rate tracking
+        self._prev_targets[env_ids] = self._targets[env_ids].clone() if hasattr(self, '_targets') else 0.0
+
+        # ── NEW: reset latch and prev height ──
+        self._holding_latch[env_ids]    = 0.0
+        self._success_latch[env_ids]    = 0.0
+        self._randomize_cube(env_ids)
+        self._prev_cube_height[env_ids] = 0.0  # cube_height is relative, always 0 at spawn
+
+        self._randomize_goals(env_ids)
+
+    def _randomize_cube(self, env_ids: torch.Tensor):
+        num   = len(env_ids)
+        low   = torch.tensor(self.cfg.cube_min, device=self.device)
+        high  = torch.tensor(self.cfg.cube_max, device=self.device)
+
+        local_pos = low + (high - low) * torch.rand(num, 3, device=self.device)
+        world_pos = local_pos + self.scene.env_origins[env_ids]
+
+        self.cube_start_z[env_ids] = local_pos[:, 2]
+
+        zeros       = torch.zeros(num, 3, device=self.device)
+        default_quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device).expand(num, -1)
+
+        self.cube.write_root_pose_to_sim(
+            torch.cat([world_pos, default_quat], dim=-1), env_ids=env_ids
+        )
+        self.cube.write_root_velocity_to_sim(
+            torch.cat([zeros, zeros], dim=-1), env_ids=env_ids
+        )
+
+    def _randomize_goals(self, env_ids: torch.Tensor):
+        num  = len(env_ids)
+        low  = torch.tensor(self.cfg.goal_min, device=self.device)
+        high = torch.tensor(self.cfg.goal_max, device=self.device)
+
+        cube_xy = self.cube.data.root_pos_w[env_ids, :2] - self.scene.env_origins[env_ids, :2]
+
+        # Resample until min XY distance from cube is satisfied
+        local_goals = low + (high - low) * torch.rand(num, 3, device=self.device)
+        for _ in range(10):
+            xy_dist = torch.norm(local_goals[:, :2] - cube_xy, dim=-1)
+            too_close = xy_dist < 0.08
+            if not too_close.any():
+                break
+            resample = low + (high - low) * torch.rand(num, 3, device=self.device)
+            local_goals = torch.where(too_close.unsqueeze(-1), resample, local_goals)
+
+        # Final fallback: pick whichever X direction gives more separation
+        xy_dist = torch.norm(local_goals[:, :2] - cube_xy, dim=-1)
+        too_close = xy_dist < 0.08
+        if too_close.any():
+            cx = cube_xy[too_close, 0]
+            cy = cube_xy[too_close, 1]
+            x_plus  = torch.clamp(cx + 0.10, min=self.cfg.goal_min[0], max=self.cfg.goal_max[0])
+            x_minus = torch.clamp(cx - 0.10, min=self.cfg.goal_min[0], max=self.cfg.goal_max[0])
+            use_plus = (x_plus - cx).abs() >= (x_minus - cx).abs()
+            chosen_x = torch.where(use_plus, x_plus, x_minus)
+            local_goals[too_close, 0] = chosen_x
+            local_goals[too_close, 1] = torch.clamp(cy, min=self.cfg.goal_min[1], max=self.cfg.goal_max[1])
+            local_goals[too_close, 2] = local_goals[too_close, 2].clamp(
+                self.cfg.goal_min[2], self.cfg.goal_max[2]
+            )
+
+        self.goals[env_ids] = local_goals + self.scene.env_origins[env_ids]
